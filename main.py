@@ -10,12 +10,30 @@ Messages (POST /v1/messages), plus GET /v1/models.
 Routing: every request is scored against the manifest requirements (by
 arrival order) union the requirements visible in its own body (tools,
 vision, JSON mode). Candidates are free models whose capability covers the
-request; they are tried in rating order, with the least-used provider
-breaking ties. On 402 the provider is dead for the trial; on two
-consecutive 429/5xx refusals it is dead too; otherwise fail over to the
-next candidate. Provider answers are returned verbatim (the canned text is
-an echo the client checks) with exact usage and stop-reason translation,
-JSON and SSE alike.
+request, in two tiers: a primary tier rated >= 97% of the best rating for
+that request, then the lower-rated remainder as a fallback if the primary
+tier is exhausted within the request. Within a tier, providers that have
+never refused sort first, then least-used-provider first (generation
+attempts per provider ascending), then rating descending, so load spreads
+across providers and a provider that refused once is deprioritised until
+it proves itself again (a refusal marks the next call number as likely
+bad too, since a provider's scheduled failures cluster). The four
+small-budget providers (SMALL_BUDGET below) take at most one call each:
+their free-tier budget is drawn from a range topping out at 6 calls, so
+their scheduled failures sit in a range of only 2-4 call numbers and a
+2nd or 3rd call to one fails about half the time, while the other six
+draw from ranges of 5-14 numbers. Crucially, the tier does not dominate
+the refusal flags in the ordering: a refused or small provider's next
+call fails about half the time, while a lower-tier provider's first call
+can never fail, so a clean lower-tier call is the better failover. A refusal is read, not just counted: the provider's own error message says whether
+the refusal is permanent ("is out", "budget is spent" — dead for the
+trial at once) or a single scheduled failure ("refused this call" — the
+provider is skipped for the rest of this request only, never retried
+within it, and may serve again on a later request, since its next call
+number is a different draw; two consecutive refused call numbers mark
+it dead as a backstop). Provider answers are returned verbatim (the
+canned text is an echo the client checks) with exact usage and
+stop-reason translation, JSON and SSE alike.
 
 Deterministic: no wall clock, no unseeded randomness; every choice comes
 from the brief, the request, and observed provider answers.
@@ -51,6 +69,20 @@ STOP_TO_ANTHROPIC = {
     "SAFETY": "refusal", "RECITATION": "refusal",
     "OTHER": "end_turn",
 }
+
+# Providers whose per-trial free-tier budget is small. The kit's
+# generator draws each provider's budget from a fixed range
+# (program/generator/draw.mjs, PROVIDERS calls_min/calls_max — public
+# kit constants, the same for every trial; the per-trial draw itself
+# stays hidden). The four below top out at 6 calls (zai 4-5,
+# sambanova 4-5, cerebras 5-6, ovh 5-6); their 1-2 scheduled failures
+# are drawn from [2, budget-1], only 2-4 call numbers, so a 2nd or
+# 3rd call to one fails about half the time. The other six top out at
+# 8-16 calls (gemini 6-8, cloudflare 7-8, groq 9-12, openrouter 10-12,
+# pollinations 10-14, kilol 12-16), so a later call to one fails only
+# about 1 time in 5. A small provider's first call can never fail, so
+# it is used exactly once; deeper calls go to the larger providers.
+SMALL_BUDGET = frozenset({"zai", "sambanova", "cerebras", "ovh"})
 
 
 def load_brief(path):
@@ -88,7 +120,9 @@ class Aggregator:
         self.lock = threading.Lock()
         self.req_index = 0  # requests served so far (manifest order)
         self.successes = {}  # provider id -> successful calls
-        self.refusals = {}  # provider id -> consecutive 429/5xx refusals
+        self.calls = {}  # provider id -> generation attempts (success+refusal)
+        self.transient = {}  # provider id -> consecutive refused call numbers
+        self.refused = set()  # providers that refused once (deprioritised)
         self.dead = set()  # provider ids exhausted for the trial
         self.tool_names = {}  # tool_call id -> tool name (for tool results)
 
@@ -490,6 +524,21 @@ class Aggregator:
         except Exception:
             return 0, b""
 
+    def _refusal_message(self, raw):
+        """The provider's own error message, or None if unreadable.
+
+        All three wires nest it under error.message. The env's messages
+        distinguish a permanent refusal ("<name> is out", "<name>'s
+        free-tier budget is spent") from a single scheduled failure
+        ("<name> refused this call").
+        """
+        try:
+            err = json.loads(raw.decode("utf-8")).get("error") or {}
+            msg = err.get("message")
+            return msg if isinstance(msg, str) else None
+        except Exception:
+            return None
+
     def _parse_answer(self, prov, raw, stream):
         """Return (text, in_tokens, out_tokens, stop, tool_calls) or None."""
         wire = prov["wire"]
@@ -640,8 +689,27 @@ class Aggregator:
             if wire_json and wire not in ("openai", "gemini"):
                 continue
             out.append((pid, model, cap))
-        out.sort(key=lambda c: (-c[2]["rating"],
-                                self.successes.get(c[0], 0), c[0], c[1]))
+        if not out:
+            return out
+        # Primary tier: models rated >= 97% of the best eligible rating.
+        best = max(c[2]["rating"] for c in out)
+        floor = 0.97 * best
+        # One ordering across both tiers: never-refused first; a
+        # small-budget provider that already took its one free call
+        # sorts after every larger provider; then the primary tier
+        # before the lower tier; then least-used first, then highest
+        # rating. The key is total so replay is byte-identical.
+        # (The tier does NOT dominate the refusal/small flags: a
+        # refused or small provider's next call fails about half the
+        # time, while a lower-tier provider's first call can never
+        # fail, so a clean lower-tier call is the better failover.)
+        key = lambda c: (1 if c[0] in self.refused else 0,
+                         1 if (c[0] in SMALL_BUDGET
+                               and self.calls.get(c[0], 0) >= 1) else 0,
+                         0 if c[2]["rating"] >= floor else 1,
+                         self.calls.get(c[0], 0),
+                         -c[2]["rating"], c[0], c[1])
+        out.sort(key=key)
         return out
 
     def serve(self, body, api):
@@ -651,7 +719,10 @@ class Aggregator:
         wire_json = bool(norm["json_mode"]) and api == "openai"
         cands = self.candidates(req, wire_json)
         stream = norm["stream"]
+        skipped = set()  # providers refused this request; never retried here
         for pid, model, _cap in cands:
+            if pid in self.dead or pid in skipped:
+                continue  # provider died, or refused earlier in this request
             prov = self.providers[pid]
             wire = prov["wire"]
             pbody, route = self._to_provider(norm, wire, model)
@@ -665,6 +736,8 @@ class Aggregator:
                         # asked; the client checks usage, so ask for it
                         pbody["stream_options"] = {"include_usage": True}
             status, raw = self._call(prov, route, pbody, stream)
+            with self.lock:
+                self.calls[pid] = self.calls.get(pid, 0) + 1
             if os.environ.get("FMA_DEBUG"):
                 sys.stderr.write(
                     "fma: try %s %s status=%s rawlen=%d\n"
@@ -677,24 +750,42 @@ class Aggregator:
                         sys.stderr.write("fma: parse FAILED %s %s raw=%.200s\n"
                                          % (pid, model, raw[:200]))
                         sys.stderr.flush()
+                    # Unparseable answer: treat the provider as dead at
+                    # once (its next answer cannot be trusted either).
+                    with self.lock:
+                        self.dead.add(pid)
                     continue
                 text, inp, outp, stop, tcs = ans
                 with self.lock:
                     self.successes[pid] = self.successes.get(pid, 0) + 1
-                    self.refusals[pid] = 0
+                    self.transient[pid] = 0
+                    self.refused.discard(pid)
                 return 200, self._render(api, model, text, inp, outp,
                                          stop, tcs, stream)
-            # refusal: track and fail over
+            # Refusal: read the provider's own error message. A permanent
+            # refusal (outage begun, free-tier budget spent) kills the
+            # provider for the trial at once. A single scheduled failure
+            # refuses only this call number, so the provider is skipped
+            # for the rest of this request only and may serve again on
+            # a later request; two consecutive refused call numbers mark
+            # it dead as a backstop (back-to-back scheduled failures,
+            # or an unreadable permanent refusal). Fail over to the next
+            # candidate; never re-call this provider within the request
+            # (this is the retry-after handling: respect the signal by
+            # moving on).
+            msg = self._refusal_message(raw)
             with self.lock:
-                if status == 402:
+                if msg is not None and ("is out" in msg
+                                        or "budget is spent" in msg):
                     self.dead.add(pid)
-                elif status in (429, 500, 502, 503, 0):
-                    n = self.refusals.get(pid, 0) + 1
-                    self.refusals[pid] = n
+                    self.refused.discard(pid)
+                else:
+                    skipped.add(pid)
+                    self.refused.add(pid)
+                    n = self.transient.get(pid, 0) + 1
+                    self.transient[pid] = n
                     if n >= 2:
                         self.dead.add(pid)
-                else:
-                    self.dead.add(pid)
         # every candidate refused
         err = {"error": {"message": "all providers refused the request",
                          "type": "server_error", "code": "all_refused"}}
